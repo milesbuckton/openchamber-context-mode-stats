@@ -31,7 +31,7 @@ import type { App, ViewRenderer } from "./app.ts"
 import { hideTip } from "./charts.ts"
 import { h, icon, iconButton, replace } from "./dom.ts"
 import { ago, bytes, duration, full } from "./format.ts"
-import { NO_REPORT_LINE, NO_REPORT_TITLE, Poller, progressLine } from "./startup.ts"
+import { NO_REPORT_LINE, NO_REPORT_TITLE, createRefreshLoop, progressLine } from "./startup.ts"
 import type { PollOutcome } from "./startup.ts"
 import { DEFAULT_SETTINGS, RANGE_LABELS, RANGE_SHORT, initialView, normalize } from "./state.ts"
 import type { RangeKey, UiSettings, View, ViewState } from "./state.ts"
@@ -54,16 +54,21 @@ let status: StatusPayload | null = null
 let mounted = false
 let surface: HostReadyContext["surface"] = "panel"
 let renderSeq = 0
-let rendering = false
-/** Automatic refreshes: quick while the service indexes, then the saved cadence. */
-const poller = new Poller({
-    run: () => render({ keepScroll: true }),
+/**
+ * Every render goes through one pump (one service request at a time; a newer
+ * request supersedes the running render and is coalesced), and the poller
+ * schedules automatic refreshes: quick while the service indexes, then the
+ * saved cadence.
+ */
+const loop = createRefreshLoop({
+    render: (opts) => render(opts),
+    supersede: () => void renderSeq++,
     isHidden: () => document.hidden || (surface !== "status" && view.view === "settings"),
-    isBusy: () => rendering,
     setTimer: (fn, ms) => window.setTimeout(fn, ms),
     clearTimer: (t) => window.clearTimeout(t as number),
     now: () => Date.now(),
 })
+const poller = loop.poller
 let lastRenderAt = 0
 const current = { sessionId: null as string | null, directory: null as string | null }
 
@@ -252,18 +257,15 @@ const VIEWS: Record<Exclude<View, "sessions">, ViewRenderer> = {
     settings: renderSettings,
 }
 
-/** Render, then let the poller schedule the next automatic refresh. */
+/** Render through the pump, then let the poller schedule the next automatic refresh. */
 function paint(opts: { keepScroll: boolean } = { keepScroll: true }): void {
-    void render(opts).then((o) => {
-        if (o) poller.observe(o)
-    })
+    void loop.paint(opts)
 }
 
-/** Draw the current view. Resolves null when a newer render superseded this one. */
+/** Draw the current view. Only the pump calls this. Resolves null when a newer render superseded this one. */
 async function render(opts: { keepScroll: boolean } = { keepScroll: true }): Promise<PollOutcome | null> {
     const seq = ++renderSeq
     const isStale = () => seq !== renderSeq
-    rendering = true
     hideTip()
     if (refs) refs.refreshBtn.classList.add("spin")
     try {
@@ -310,10 +312,7 @@ async function render(opts: { keepScroll: boolean } = { keepScroll: true }): Pro
         if (surface === "status") void host.setHeight(Math.ceil(root!.scrollHeight)).catch(() => undefined)
         return { ready: f.code === "NOT_FOUND" && status?.progress.phase === "ready" }
     } finally {
-        if (!isStale()) {
-            rendering = false
-            refs?.refreshBtn.classList.remove("spin")
-        }
+        if (!isStale()) refs?.refreshBtn.classList.remove("spin")
     }
 }
 
@@ -385,9 +384,8 @@ host.onReady((ctx) => {
             void loadProjects()
             window.setInterval(() => { if (!document.hidden) void loadProjects() }, 60_000)
         }
-        const first = await render({ keepScroll: false })
         poller.configure(settings.display.refreshSec)
-        if (first) poller.observe(first)
+        await loop.paint({ keepScroll: false })
     })()
 })
 

@@ -137,13 +137,15 @@ describe("startup polling", () => {
         assert.equal(h.pending().length, 0)
     })
 
-    it("a superseded request leaves scheduling to the render that replaced it", async () => {
+    it("a superseded request re-arms from the latest state; the replacing render's result then wins", async () => {
         const h = harness([null])
         h.poller.configure(60)
         h.poller.observe(notReady)
         await h.fire()
-        assert.equal(h.pending().length, 0)
+        assert.equal(h.pending().length, 1, "never left without a timer")
+        assert.ok(h.pending()[0].ms <= STARTUP_DELAYS[STARTUP_DELAYS.length - 1], "still starting: quick")
         h.poller.observe(ready)
+        assert.equal(h.pending().length, 1)
         assert.equal(h.pending()[0].ms, 60_000)
     })
 

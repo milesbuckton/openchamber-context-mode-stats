@@ -113,16 +113,107 @@ export class Poller {
         }
         if (this.starting) this.attempt++
         this.inFlight = true
+        // A run that was superseded (null) or failed has no result of its own: re-arm from
+        // whatever a newer render last observed instead of inventing one. Disposal wins.
         this.deps.run().then(
             (o) => {
                 this.inFlight = false
                 if (o) this.observe(o)
+                else this.schedule()
             },
             () => {
                 this.inFlight = false
-                this.observe({ ready: false })
+                this.schedule()
             },
         )
+    }
+}
+
+// ------------------------------------------------------------ render pump
+
+export interface RenderOpts {
+    keepScroll: boolean
+}
+
+/**
+ * One render at a time. A request made while a render runs marks that render
+ * superseded (it stops at its next checkpoint and resolves null) and queues one
+ * follow-up render; further requests merge into it. The follow-up reads the
+ * view state when it starts, so the latest navigation wins, and it keeps
+ * scroll-to-top if any merged request asked for it. Every waiter of a merged
+ * request gets the follow-up's outcome.
+ */
+export class RenderPump {
+    private active = false
+    private queued: { opts: RenderOpts; waiters: ((o: PollOutcome | null) => void)[] } | null = null
+    private readonly render: (opts: RenderOpts) => Promise<PollOutcome | null>
+    private readonly supersede: () => void
+
+    constructor(render: (opts: RenderOpts) => Promise<PollOutcome | null>, supersede: () => void) {
+        this.render = render
+        this.supersede = supersede
+    }
+
+    get busy(): boolean {
+        return this.active
+    }
+
+    request(opts: RenderOpts): Promise<PollOutcome | null> {
+        if (!this.active) return this.start(opts)
+        this.supersede()
+        if (this.queued) this.queued.opts = { keepScroll: this.queued.opts.keepScroll && opts.keepScroll }
+        else this.queued = { opts: { keepScroll: opts.keepScroll }, waiters: [] }
+        const q = this.queued
+        return new Promise((resolve) => q.waiters.push(resolve))
+    }
+
+    private start(opts: RenderOpts): Promise<PollOutcome | null> {
+        this.active = true
+        const done = this.render(opts).catch(() => null)
+        void done.then(() => {
+            this.active = false
+            const q = this.queued
+            if (!q) return
+            this.queued = null
+            void this.start(q.opts).then((o) => {
+                for (const w of q.waiters) w(o)
+            })
+        })
+        return done
+    }
+}
+
+export interface RefreshLoopDeps {
+    render(opts: RenderOpts): Promise<PollOutcome | null>
+    /** Make the running render stale so it stops at its next checkpoint. */
+    supersede(): void
+    isHidden(): boolean
+    setTimer(fn: () => void, ms: number): unknown
+    clearTimer(handle: unknown): void
+    now(): number
+}
+
+/** The panel's refresh wiring: every render, automatic or not, goes through one pump. */
+export function createRefreshLoop(deps: RefreshLoopDeps) {
+    const pump = new RenderPump((o) => deps.render(o), () => deps.supersede())
+    const poller = new Poller({
+        run: () => pump.request({ keepScroll: true }),
+        isHidden: () => deps.isHidden(),
+        isBusy: () => pump.busy,
+        setTimer: (fn, ms) => deps.setTimer(fn, ms),
+        clearTimer: (h) => deps.clearTimer(h),
+        now: () => deps.now(),
+    })
+    return {
+        pump,
+        poller,
+        /** A user- or host-initiated render; its result updates the polling schedule. */
+        paint(opts: RenderOpts): Promise<PollOutcome | null> {
+            return pump.request(opts).then((o) => {
+                if (o) poller.observe(o)
+                return o
+            })
+        },
     }
 }
 

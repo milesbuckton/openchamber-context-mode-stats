@@ -28,8 +28,21 @@ export function friendly(error: unknown): { code: string; message: string } {
     return { code: "UNKNOWN", message: error instanceof Error ? error.message : String(error) }
 }
 
+/**
+ * Service client. Calls are queued so at most one request is open per page:
+ * parallel callers (a view's Promise.all, the project list, a render that a
+ * newer one superseded) wait their turn instead of stacking up on a service
+ * that is still indexing. A failed call rejects only its own caller.
+ */
 export function createApi(host: HostClient, settings: () => ServiceSettings) {
-    return async function call<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
+    let tail: Promise<unknown> = Promise.resolve()
+    return function call<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
+        const run = tail.then(() => send<T>(path, body))
+        tail = run.catch(() => undefined)
+        return run
+    }
+
+    async function send<T>(path: string, body: Record<string, unknown>): Promise<T> {
         const res = await host.serviceRequest({ method: "POST", path, body: JSON.stringify({ ...body, settings: settings() }) })
         let payload: unknown = res.body
         if (typeof payload === "string") {
