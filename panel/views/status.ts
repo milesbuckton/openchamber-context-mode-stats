@@ -1,14 +1,16 @@
 /** The compact card in the chat's Work Status panel: this chat's context, at a glance. */
 
-import type { BriefPayload } from "../../service/types.ts"
+import type { BriefPayload, IndexProgress } from "../../service/types.ts"
 import type { App } from "../app.ts"
 import { trail } from "../charts.ts"
 import { h, replace } from "../dom.ts"
 import { bytes, count, duration, full } from "../format.ts"
+import { NO_REPORT_LINE, NO_REPORT_TITLE, progressLine } from "../startup.ts"
 
-export async function renderStatus(app: App, el: HTMLElement, isStale: () => boolean): Promise<void> {
+/** Draws the card; returns the service's index progress (null when superseded). */
+export async function renderStatus(app: App, el: HTMLElement, isStale: () => boolean): Promise<IndexProgress | null> {
     const b = await app.api<BriefPayload>("/v1/brief", { sessionId: app.current.sessionId, directory: app.current.directory })
-    if (isStale()) return
+    if (isStale()) return null
     const s = b.session
     const lives = b.liveRuns
     const sum = (f: (r: (typeof lives)[number]) => number) => lives.reduce((a, r) => a + f(r), 0)
@@ -18,17 +20,19 @@ export async function renderStatus(app: App, el: HTMLElement, isStale: () => boo
             h("span", null, h("b", null, bytes(sum((r) => r.bytesReturned))), " returned"),
             h("span", null, h("b", null, bytes(sum((r) => r.bytesIndexed))), " indexed"),
             h("span", null, "up ", duration(Math.max(...lives.map((r) => r.uptimeMs)))))
-        : h("div.status-line", null, "context-mode server not running")
-    if (b.progress.phase === "scanning" && !s) {
-        replace(el, h("div.status", null, h("div.status-line", null, `Indexing context-mode history… ${full(b.progress.done)} / ${full(b.progress.total)}`), liveLine))
-        return
+        : h("div.status-line", { title: NO_REPORT_TITLE }, NO_REPORT_LINE)
+    const indexing = progressLine(b.progress)
+    const indexLine = indexing ? h("div.status-line.status-index", { title: indexing }, b.progress.phase === "loading" ? "Loading the saved index…" : `${b.progress.cached || b.progress.stale ? "Updating index" : "Indexing history"}… ${full(b.progress.done)} / ${full(b.progress.total)}`) : null
+    if (indexing && !s) {
+        replace(el, h("div.status", null, indexLine, liveLine))
+        return b.progress
     }
     if (!s) {
         replace(el, h("div.status", null,
             h("div.status-line", null, app.current.sessionId ? "No context-mode events for this chat yet." : "Open a chat to see its context."),
             b.project ? h("div.status-line", null, h("span", null, h("b", null, full(b.project.sessions)), " sessions in this project"), h("span", null, h("b", null, count(b.project.tokens)), " tokens")) : null,
             liveLine))
-        return
+        return b.progress
     }
     const latest = s.usage.lastContext
     replace(el, h("div.status", null,
@@ -43,5 +47,7 @@ export async function renderStatus(app: App, el: HTMLElement, isStale: () => boo
             s.tally.errors ? h("span", null, h("b", { style: "color:var(--oc-error-text)" }, full(s.tally.errors)), " errors") : null,
             s.tally.compactions ? h("span", null, h("b", null, full(s.tally.compactions)), s.tally.compactions === 1 ? " compaction" : " compactions") : null,
             s.childCount ? h("span", null, h("b", null, full(s.childCount)), s.childCount === 1 ? " subagent" : " subagents") : null),
+        indexLine,
         liveLine))
+    return b.progress
 }

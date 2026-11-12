@@ -1,8 +1,9 @@
 // service/main.ts
 import http from "node:http";
+import * as path8 from "node:path";
 
 // service/engine.ts
-import * as path6 from "node:path";
+import * as path7 from "node:path";
 
 // service/discover.ts
 import * as fs from "node:fs";
@@ -236,7 +237,14 @@ function usedPaths(report, kind) {
 }
 
 // service/events.ts
+import * as fs3 from "node:fs";
+import * as path4 from "node:path";
+
+// service/indexcache.ts
+import { createHash, randomUUID } from "node:crypto";
 import * as fs2 from "node:fs";
+import * as fsp from "node:fs/promises";
+import * as os2 from "node:os";
 import * as path3 from "node:path";
 
 // service/util.ts
@@ -307,6 +315,311 @@ function clampInt(v, lo, hi, dflt) {
   return Math.min(hi, Math.max(lo, Math.round(n)));
 }
 var yieldTick = () => new Promise((r) => setImmediate(r));
+
+// service/indexcache.ts
+var CACHE_FORMAT = "context-mode-stats/event-index";
+var CACHE_VERSION = 1;
+var BUCKETS = 64;
+var MAX_BUCKET_BYTES = 64 * 1024 * 1024;
+var STALE_TMP_MS = 60 * 60 * 1000;
+var FLUSH_EVERY_MS = 15000;
+var RENAME_TRIES = 8;
+var DAY_RE2 = /^\d{4}-\d{2}-\d{2}$/;
+var B64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+var timeZone = () => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "unknown";
+  } catch {
+    return "unknown";
+  }
+};
+function normScopeDir(p) {
+  const r = path3.resolve(p);
+  return process.platform === "win32" ? r.toLowerCase() : r;
+}
+function bucketOf(file) {
+  const n = createHash("sha256").update(file).digest().readUInt16BE(0) % BUCKETS;
+  return `bucket-${n.toString(16).padStart(2, "0")}.json`;
+}
+function encodeSession(s) {
+  return {
+    id: s.id,
+    projectDir: s.projectDir,
+    startedAt: s.startedAt,
+    lastEventAt: s.lastEventAt,
+    compactions: s.compactions,
+    resumes: s.resumes,
+    events: s.events,
+    types: s.types,
+    days: [...s.days].map(([k, d]) => [k, d.types, d.hours]),
+    steps: Buffer.from(s.steps.buffer, s.steps.byteOffset, s.steps.byteLength).toString("base64")
+  };
+}
+var num = (v) => typeof v === "number" && Number.isFinite(v);
+function counts(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v))
+    return null;
+  const out = {};
+  for (const [k, c] of Object.entries(v)) {
+    if (!num(c))
+      return null;
+    out[k] = c;
+  }
+  return out;
+}
+function decodeSession(v, file) {
+  if (!v || typeof v !== "object")
+    return null;
+  const o = v;
+  if (typeof o.id !== "string" || !o.id || typeof o.projectDir !== "string")
+    return null;
+  if (!num(o.startedAt) || !num(o.lastEventAt) || !num(o.compactions) || !num(o.resumes) || !num(o.events))
+    return null;
+  const types = counts(o.types);
+  if (!types || !Array.isArray(o.days) || typeof o.steps !== "string")
+    return null;
+  const days = new Map;
+  for (const d of o.days) {
+    if (!Array.isArray(d) || d.length !== 3 || typeof d[0] !== "string" || !DAY_RE2.test(d[0]))
+      return null;
+    const dt = counts(d[1]);
+    const hours = d[2];
+    if (!dt || !Array.isArray(hours) || hours.length !== 24 || !hours.every(num))
+      return null;
+    days.set(d[0], { types: dt, hours });
+  }
+  if (o.steps.length % 4 !== 0 || !B64_RE.test(o.steps))
+    return null;
+  const buf = Buffer.from(o.steps, "base64");
+  if (buf.byteLength % 48 !== 0)
+    return null;
+  const steps = new Float64Array(buf.byteLength / 8);
+  new Uint8Array(steps.buffer).set(buf);
+  if (!steps.every(Number.isFinite))
+    return null;
+  return { id: o.id, dbFile: file, projectDir: o.projectDir, startedAt: o.startedAt, lastEventAt: o.lastEventAt, compactions: o.compactions, resumes: o.resumes, events: o.events, types, days, steps };
+}
+function decodeEntry(file, v) {
+  if (!v || typeof v !== "object")
+    return null;
+  const e = v;
+  if (typeof e.stamp !== "string" || !e.stamp || !num(e.savedAt) || !Array.isArray(e.sessions))
+    return null;
+  const sessions = [];
+  for (const s of e.sessions) {
+    const d = decodeSession(s, file);
+    if (!d)
+      return null;
+    sessions.push(d);
+  }
+  return { file, stamp: e.stamp, savedAt: e.savedAt, sessions };
+}
+
+class IndexCache {
+  dir;
+  tz = timeZone();
+  endian = os2.endianness();
+  own = new Map;
+  scope = new Set;
+  dirty = new Set;
+  flushing = null;
+  timer = null;
+  lastFlush = 0;
+  disposed = false;
+  writeErrors = 0;
+  constructor(dir) {
+    this.dir = dir;
+  }
+  setScope(dirs) {
+    this.own.clear();
+    this.dirty.clear();
+    this.scope = new Set(dirs.map(normScopeDir));
+  }
+  inScope(file) {
+    return this.scope.has(normScopeDir(path3.dirname(file)));
+  }
+  header() {
+    return { format: CACHE_FORMAT, version: CACHE_VERSION, timeZone: this.tz, endian: this.endian };
+  }
+  async readBucket(name) {
+    const file = path3.join(this.dir, name);
+    try {
+      const st = await fsp.stat(file);
+      if (!st.isFile() || st.size > MAX_BUCKET_BYTES)
+        return null;
+      const j = JSON.parse(await fsp.readFile(file, "utf8"));
+      const h = this.header();
+      if (j.format !== h.format || j.version !== h.version || j.timeZone !== h.timeZone || j.endian !== h.endian)
+        return null;
+      if (!j.entries || typeof j.entries !== "object" || Array.isArray(j.entries))
+        return null;
+      return j;
+    } catch {
+      return null;
+    }
+  }
+  async bucketNames() {
+    let names;
+    try {
+      names = await fsp.readdir(this.dir);
+    } catch {
+      return [];
+    }
+    const now = Date.now();
+    for (const n of names) {
+      if (!n.endsWith(".tmp"))
+        continue;
+      try {
+        const st = await fsp.stat(path3.join(this.dir, n));
+        if (now - st.mtimeMs > STALE_TMP_MS)
+          await fsp.unlink(path3.join(this.dir, n));
+      } catch {}
+    }
+    return names.filter((n) => /^bucket-[0-9a-f]{2}\.json$/.test(n));
+  }
+  async load(present) {
+    const want = new Set(present);
+    const out = new Map;
+    for (const name of await this.bucketNames()) {
+      if (this.disposed)
+        break;
+      const b = await this.readBucket(name);
+      if (!b) {
+        this.dirty.add(name);
+        continue;
+      }
+      for (const [file, raw] of Object.entries(b.entries)) {
+        if (bucketOf(file) !== name)
+          continue;
+        if (!want.has(file)) {
+          if (this.inScope(file))
+            this.dirty.add(name);
+          continue;
+        }
+        const e = decodeEntry(file, raw);
+        if (e)
+          out.set(file, e);
+        else
+          this.dirty.add(name);
+      }
+      await yieldTick();
+    }
+    return out;
+  }
+  adopt(e) {
+    this.own.set(e.file, e);
+  }
+  put(e) {
+    if (this.disposed)
+      return;
+    this.own.set(e.file, e);
+    this.dirty.add(bucketOf(e.file));
+  }
+  remove(file) {
+    if (this.disposed)
+      return;
+    if (this.own.delete(file) || this.inScope(file))
+      this.dirty.add(bucketOf(file));
+  }
+  requestFlush() {
+    if (this.disposed || !this.dirty.size || this.timer)
+      return;
+    const wait = Math.max(0, FLUSH_EVERY_MS - (Date.now() - this.lastFlush));
+    if (wait === 0 && !this.flushing) {
+      this.flush();
+      return;
+    }
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.flush();
+    }, wait || FLUSH_EVERY_MS);
+    this.timer.unref?.();
+  }
+  flush() {
+    const run = async () => {
+      if (!this.dirty.size)
+        return;
+      this.lastFlush = Date.now();
+      try {
+        await fsp.mkdir(this.dir, { recursive: true, mode: 448 });
+      } catch {
+        this.writeErrors++;
+        return;
+      }
+      const names = [...this.dirty];
+      this.dirty.clear();
+      for (const name of names)
+        await this.writeBucket(name);
+    };
+    const next = (this.flushing ?? Promise.resolve()).then(run, run);
+    const tracked = next.finally(() => {
+      if (this.flushing === tracked)
+        this.flushing = null;
+    });
+    this.flushing = tracked;
+    return tracked;
+  }
+  async writeBucket(name) {
+    const entries = {};
+    const current = await this.readBucket(name);
+    if (current) {
+      for (const [file, raw] of Object.entries(current.entries)) {
+        if (this.own.has(file) || this.inScope(file) || bucketOf(file) !== name)
+          continue;
+        if (fs2.existsSync(file))
+          entries[file] = raw;
+      }
+    }
+    for (const e of this.own.values()) {
+      if (bucketOf(e.file) !== name)
+        continue;
+      entries[e.file] = { stamp: e.stamp, savedAt: e.savedAt, sessions: e.sessions.map(encodeSession) };
+    }
+    const target = path3.join(this.dir, name);
+    if (!Object.keys(entries).length) {
+      await fsp.rm(target, { force: true }).catch(() => {
+        return;
+      });
+      return;
+    }
+    const body = JSON.stringify({ ...this.header(), entries });
+    if (body.length > MAX_BUCKET_BYTES) {
+      this.writeErrors++;
+      return;
+    }
+    const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await fsp.writeFile(tmp, body, { encoding: "utf8", mode: 384, flag: "wx" });
+      for (let i = 0;; i++) {
+        try {
+          await fsp.rename(tmp, target);
+          return;
+        } catch (error) {
+          const code = error.code;
+          if (i >= RENAME_TRIES || !(code === "EPERM" || code === "EACCES" || code === "EBUSY"))
+            throw error;
+          await new Promise((r) => setTimeout(r, 15 * (i + 1)));
+        }
+      }
+    } catch {
+      this.writeErrors++;
+      await fsp.rm(tmp, { force: true }).catch(() => {
+        return;
+      });
+    }
+  }
+  async dispose() {
+    if (this.timer)
+      clearTimeout(this.timer);
+    this.timer = null;
+    if (this.disposed) {
+      await this.flushing;
+      return;
+    }
+    await this.flush();
+    this.disposed = true;
+  }
+}
 
 // service/events.ts
 var STEP_STRIDE = 6;
@@ -473,12 +786,12 @@ function typeGroup(type) {
     return "compaction";
   return "other";
 }
-function fileStamp(file) {
-  const st = fs2.statSync(file, { throwIfNoEntry: false });
+function fileStat(file) {
+  const st = fs3.statSync(file, { throwIfNoEntry: false });
   if (!st)
     return null;
-  const wal = fs2.statSync(file + "-wal", { throwIfNoEntry: false });
-  return `${st.size}:${st.mtimeMs}:${wal?.size ?? 0}:${wal?.mtimeMs ?? 0}`;
+  const wal = fs3.statSync(file + "-wal", { throwIfNoEntry: false });
+  return { stamp: `${st.size}:${st.mtimeMs}:${wal?.size ?? 0}:${wal?.mtimeMs ?? 0}`, mtime: Math.max(st.mtimeMs, wal?.mtimeMs ?? 0) };
 }
 function indexSessionDb(file) {
   return withDb(file, (db) => readSessions(db, file));
@@ -552,7 +865,7 @@ function readSessions(db, file) {
   return [...sessions.values()];
 }
 function mergeSession(parts) {
-  const ordered = [...parts].sort((a, b) => b.events - a.events || (a.startedAt || Infinity) - (b.startedAt || Infinity));
+  const ordered = [...parts].sort((a, b) => b.events - a.events || (a.startedAt || Infinity) - (b.startedAt || Infinity) || (a.dbFile < b.dbFile ? -1 : a.dbFile > b.dbFile ? 1 : 0));
   const home = ordered[0];
   const types = {};
   const days = new Map;
@@ -580,7 +893,7 @@ function mergeSession(parts) {
   }
   const seen = new Set;
   const merged = [];
-  const all = parts.length === 1 ? [parts[0].steps] : parts.map((p) => p.steps);
+  const all = ordered.map((p) => p.steps);
   for (const steps2 of all) {
     for (let o = 0;o < steps2.length; o += STEP_STRIDE) {
       const key = `${steps2[o]}|${steps2[o + 1]}|${steps2[o + 2]}|${steps2[o + 3]}|${steps2[o + 4]}`;
@@ -630,60 +943,135 @@ function mergeSession(parts) {
     steps
   };
 }
+var hashOf = (file) => path4.basename(file, ".db").split("__")[0];
 
 class EventIndex {
   dbs = new Map;
   running = null;
+  runningGen = -1;
+  gen = 0;
   dirsKey = "";
   merged = new Map;
   dirty = new Set;
   list = null;
+  cache;
+  reader;
+  sliceMs;
+  cacheLoaded = false;
+  disposed = false;
+  useful;
   lastRefresh = 0;
   progress = { phase: "idle", done: 0, total: 0, startedAt: 0, finishedAt: 0 };
   version = 0;
   initialDone = false;
+  constructor(opts = {}) {
+    this.cache = opts.cacheDir ? new IndexCache(opts.cacheDir) : null;
+    this.reader = opts.reader ?? indexSessionDb;
+    this.sliceMs = Math.max(0, opts.sliceMs ?? 30);
+    this.useful = deferred();
+  }
   refresh(dirs) {
     const key = dirs.join("|");
     if (key !== this.dirsKey) {
       this.dirsKey = key;
+      this.gen++;
       this.dbs.clear();
       this.merged.clear();
       this.dirty.clear();
       this.list = null;
       this.initialDone = false;
+      this.cacheLoaded = false;
+      this.useful.resolve();
+      this.useful = deferred();
+      this.progress = { phase: "idle", done: 0, total: 0, startedAt: 0, finishedAt: 0 };
       this.version++;
     }
-    if (this.running)
+    if (this.disposed)
+      return Promise.resolve();
+    if (this.running && this.runningGen === this.gen)
       return this.running;
-    this.running = this.run(dirs).finally(() => {
-      this.running = null;
+    const gen = this.gen;
+    const p = (this.running ?? Promise.resolve()).catch(() => {
+      return;
+    }).then(() => this.run(dirs, gen)).finally(() => {
+      if (this.running === p)
+        this.running = null;
       this.lastRefresh = Date.now();
+      if (gen === this.gen)
+        this.useful.resolve();
     });
-    return this.running;
+    this.running = p;
+    this.runningGen = gen;
+    return p;
   }
   get busy() {
     return this.running !== null;
   }
-  async run(dirs) {
+  whenUseful() {
+    return this.initialDone ? Promise.resolve() : this.useful.promise;
+  }
+  async dispose() {
+    this.disposed = true;
+    await this.running?.catch(() => {
+      return;
+    });
+    await this.cache?.dispose();
+  }
+  live(gen) {
+    return !this.disposed && gen === this.gen;
+  }
+  async run(dirs, gen) {
+    if (!this.live(gen))
+      return;
     const files = [];
     for (const dir of dirs) {
       let entries = [];
       try {
-        entries = fs2.readdirSync(dir);
+        entries = fs3.readdirSync(dir);
       } catch {
         continue;
       }
       for (const name of entries)
         if (SESSION_DB_RE.test(name))
-          files.push(path3.join(dir, name));
+          files.push(path4.join(dir, name));
     }
+    let cached = 0;
+    if (!this.cacheLoaded) {
+      this.cacheLoaded = true;
+      if (this.cache) {
+        this.progress = { phase: "loading", done: 0, total: 0, startedAt: Date.now(), finishedAt: 0 };
+        this.cache.setScope(dirs);
+        const loaded = await this.cache.load(files);
+        if (!this.live(gen))
+          return;
+        for (const e of loaded.values()) {
+          this.cache.adopt(e);
+          this.dbs.set(e.file, { file: e.file, hash: hashOf(e.file), stamp: e.stamp, sessions: e.sessions, savedAt: e.savedAt, saved: true });
+          for (const s of e.sessions)
+            this.dirty.add(s.id);
+        }
+        if (loaded.size)
+          this.bump();
+      }
+    }
+    const initial = !this.initialDone;
     const changed = [];
+    let slice = performance.now();
     for (const file of files) {
-      const stamp = fileStamp(file);
-      if (!stamp)
+      const st = fileStat(file);
+      if (!st)
         continue;
-      if (this.dbs.get(file)?.stamp !== stamp)
-        changed.push([file, stamp]);
+      const prev = this.dbs.get(file);
+      if (prev?.stamp !== st.stamp)
+        changed.push({ file, ...st });
+      else if (initial && prev?.saved)
+        cached++;
+      if (performance.now() - slice >= Math.max(this.sliceMs, 5)) {
+        await yieldTick();
+        if (!this.live(gen))
+          return;
+        slice = performance.now();
+      }
     }
     const present = new Set(files);
     let removed = false;
@@ -693,48 +1081,91 @@ class EventIndex {
       for (const s of db.sessions)
         this.dirty.add(s.id);
       this.dbs.delete(file);
+      this.cache?.remove(file);
       removed = true;
     }
     if (!changed.length) {
       if (removed)
         this.bump();
-      if (!this.initialDone)
-        this.finish(files.length);
+      if (initial)
+        this.finish(files.length, cached);
+      this.save(initial);
       return;
     }
-    const initial = !this.initialDone;
-    if (initial)
-      this.progress = { phase: "scanning", done: 0, total: changed.length, startedAt: Date.now(), finishedAt: 0 };
+    changed.sort((a, b) => b.mtime - a.mtime);
+    let stale = 0;
+    let savedAt = 0;
+    for (const c of changed) {
+      const prev = this.dbs.get(c.file);
+      if (prev?.saved) {
+        stale++;
+        savedAt = savedAt ? Math.min(savedAt, prev.savedAt ?? 0) : prev.savedAt ?? 0;
+      }
+    }
+    if (initial) {
+      this.progress = {
+        phase: "scanning",
+        done: 0,
+        total: changed.length,
+        startedAt: this.progress.startedAt || Date.now(),
+        finishedAt: 0,
+        cached,
+        stale,
+        savedAt: stale ? savedAt : 0
+      };
+    }
     let i = 0;
-    for (const [file, stamp] of changed) {
-      const hash = path3.basename(file, ".db").split("__")[0];
+    slice = performance.now();
+    for (const { file, stamp } of changed) {
+      if (!this.live(gen))
+        return;
       const prev = this.dbs.get(file);
       if (prev)
         for (const s of prev.sessions)
           this.dirty.add(s.id);
+      let reread = false;
       try {
-        const sessions = indexSessionDb(file);
+        const sessions = this.reader(file);
+        reread = true;
         for (const s of sessions)
           this.dirty.add(s.id);
-        this.dbs.set(file, { file, hash, stamp, sessions });
+        this.dbs.set(file, { file, hash: hashOf(file), stamp, sessions });
+        this.cache?.put({ file, stamp, savedAt: Date.now(), sessions });
       } catch (error) {
-        this.dbs.set(file, { file, hash, stamp: "", sessions: prev?.sessions ?? [], error: error instanceof Error ? error.message : String(error) });
+        this.dbs.set(file, { file, hash: hashOf(file), stamp: "", sessions: prev?.sessions ?? [], savedAt: prev?.savedAt, saved: prev?.saved, error: error instanceof Error ? error.message : String(error) });
       }
       i++;
-      if (initial)
+      if (initial) {
         this.progress.done = i;
-      if (i % 8 === 0) {
+        if (reread && prev?.saved && this.progress.stale)
+          this.progress.stale--;
+        if (!this.progress.stale)
+          this.progress.savedAt = 0;
+      }
+      if (performance.now() - slice >= this.sliceMs) {
         if (initial)
           this.bump();
+        this.useful.resolve();
+        this.cache?.requestFlush();
         await yieldTick();
+        slice = performance.now();
       }
     }
     this.bump();
-    this.finish(files.length);
+    if (initial)
+      this.finish(files.length, cached);
+    this.save(initial);
   }
-  finish(total) {
+  save(now) {
+    if (now)
+      this.cache?.flush();
+    else
+      this.cache?.requestFlush();
+  }
+  finish(total, cached) {
     this.initialDone = true;
-    this.progress = { phase: "ready", done: total, total, startedAt: this.progress.startedAt, finishedAt: Date.now() };
+    this.progress = { phase: "ready", done: total, total, startedAt: this.progress.startedAt, finishedAt: Date.now(), cached, stale: 0, savedAt: 0 };
+    this.useful.resolve();
   }
   bump() {
     this.version++;
@@ -765,7 +1196,7 @@ class EventIndex {
       }
       this.dirty.clear();
     }
-    this.list = [...this.merged.values()];
+    this.list = [...this.merged.values()].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
     return this.list;
   }
   get(id) {
@@ -773,9 +1204,9 @@ class EventIndex {
     return this.merged.get(id);
   }
   projectForHash(hash) {
-    for (const db of this.dbs.values()) {
-      if (db.hash !== hash)
-        continue;
+    const rank = (db) => path4.basename(db.file) === `${hash}.db` ? "" : path4.basename(db.file);
+    const candidates = [...this.dbs.values()].filter((db) => db.hash === hash).sort((a, b) => rank(a) < rank(b) ? -1 : rank(a) > rank(b) ? 1 : 0);
+    for (const db of candidates) {
       const best = [...db.sessions].sort((a, b) => b.events - a.events).find((s) => s.projectDir);
       if (best)
         return best.projectDir;
@@ -786,10 +1217,17 @@ class EventIndex {
     return [...this.dbs.values()].filter((d) => d.error).map((d) => ({ file: d.file, error: d.error }));
   }
 }
+function deferred() {
+  let resolve3 = () => {
+    return;
+  };
+  const promise = new Promise((r) => resolve3 = r);
+  return { promise, resolve: resolve3 };
+}
 
 // service/knowledge.ts
-import * as fs3 from "node:fs";
-import * as path4 from "node:path";
+import * as fs4 from "node:fs";
+import * as path5 from "node:path";
 function sourceKind(label) {
   if (/::https?:\/\//i.test(label) || /^https?:\/\//i.test(label))
     return "fetch";
@@ -814,19 +1252,19 @@ class KnowledgeStore {
     for (const dir of dirs) {
       let entries = [];
       try {
-        entries = fs3.readdirSync(dir);
+        entries = fs4.readdirSync(dir);
       } catch {
         continue;
       }
       for (const name of entries) {
         if (!CONTENT_DB_RE.test(name))
           continue;
-        const file = path4.join(dir, name);
+        const file = path5.join(dir, name);
         seen.add(file);
-        const st = fs3.statSync(file, { throwIfNoEntry: false });
+        const st = fs4.statSync(file, { throwIfNoEntry: false });
         if (!st)
           continue;
-        const wal = fs3.statSync(file + "-wal", { throwIfNoEntry: false });
+        const wal = fs4.statSync(file + "-wal", { throwIfNoEntry: false });
         const stamp = `${st.size}:${st.mtimeMs}:${wal?.size ?? 0}:${wal?.mtimeMs ?? 0}`;
         let hit = this.cache.get(file);
         if (!hit || hit.stamp !== stamp) {
@@ -848,7 +1286,7 @@ class KnowledgeStore {
   }
 }
 function readContentDb(file, bytes) {
-  const name = path4.basename(file);
+  const name = path5.basename(file);
   const hash = name.replace(/\.db$/, "").split("__")[0];
   return withDb(file, (db) => {
     const sources = [];
@@ -875,14 +1313,14 @@ function readContentDb(file, bytes) {
         oldestAt = s.indexedAt;
     }
     return {
-      summary: { file, dir: path4.dirname(file), hash, projectDir: null, bytes, sources: sources.length, chunks, codeChunks, newestAt, oldestAt },
+      summary: { file, dir: path5.dirname(file), hash, projectDir: null, bytes, sources: sources.length, chunks, codeChunks, newestAt, oldestAt },
       sources
     };
   });
 }
 
 // service/opencode.ts
-import * as fs4 from "node:fs";
+import * as fs5 from "node:fs";
 function modelLabel(v) {
   const s = str(v).trim();
   if (!s)
@@ -950,13 +1388,13 @@ class OpencodeStore {
       this.error = null;
       return this.sessions;
     }
-    const st = fs4.statSync(file, { throwIfNoEntry: false });
+    const st = fs5.statSync(file, { throwIfNoEntry: false });
     if (!st) {
       this.sessions = new Map;
       this.error = "not found";
       return this.sessions;
     }
-    const wal = fs4.statSync(file + "-wal", { throwIfNoEntry: false });
+    const wal = fs5.statSync(file + "-wal", { throwIfNoEntry: false });
     const stamp = `${st.size}:${st.mtimeMs}:${wal?.size ?? 0}:${wal?.mtimeMs ?? 0}`;
     if (file === this.file && stamp === this.stamp)
       return this.sessions;
@@ -981,45 +1419,45 @@ class OpencodeStore {
 }
 
 // service/runs.ts
-import * as fs5 from "node:fs";
-import * as path5 from "node:path";
+import * as fs6 from "node:fs";
+import * as path6 from "node:path";
 var STALE_MS = 6 * 3600000;
 var isRecord = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
-var num = (v) => typeof v === "number" && Number.isFinite(v) ? v : 0;
+var num2 = (v) => typeof v === "number" && Number.isFinite(v) ? v : 0;
 function parseRunFile(pid, raw, sourceDir) {
   if (!isRecord(raw))
     return null;
-  const startedAt = num(raw.session_start);
-  const updatedAt = num(raw.updated_at);
+  const startedAt = num2(raw.session_start);
+  const updatedAt = num2(raw.updated_at);
   if (!startedAt && !updatedAt)
     return null;
   const tools = [];
   if (isRecord(raw.by_tool)) {
-    for (const [name, stat] of Object.entries(raw.by_tool)) {
-      if (!isRecord(stat))
+    for (const [name, stat2] of Object.entries(raw.by_tool)) {
+      if (!isRecord(stat2))
         continue;
-      tools.push({ name, calls: num(stat.calls), bytes: num(stat.bytes) });
+      tools.push({ name, calls: num2(stat2.calls), bytes: num2(stat2.bytes) });
     }
     tools.sort((a, b) => b.calls - a.calls || b.bytes - a.bytes);
   }
-  const bytesIndexed = num(raw.bytes_indexed);
-  const bytesSandboxed = num(raw.bytes_sandboxed);
-  const cacheBytesSaved = num(raw.cache_bytes_saved);
+  const bytesIndexed = num2(raw.bytes_indexed);
+  const bytesSandboxed = num2(raw.bytes_sandboxed);
+  const cacheBytesSaved = num2(raw.cache_bytes_saved);
   return {
     key: `${pid}@${startedAt}`,
     pid,
     alive: false,
     startedAt,
     updatedAt,
-    uptimeMs: num(raw.uptime_ms) || Math.max(0, updatedAt - startedAt),
+    uptimeMs: num2(raw.uptime_ms) || Math.max(0, updatedAt - startedAt),
     version: typeof raw.version === "string" ? raw.version : null,
-    calls: num(raw.total_calls),
-    bytesReturned: num(raw.bytes_returned),
+    calls: num2(raw.total_calls),
+    bytesReturned: num2(raw.bytes_returned),
     bytesIndexed,
     bytesSandboxed,
-    cacheHits: num(raw.cache_hits),
+    cacheHits: num2(raw.cache_hits),
     cacheBytesSaved,
-    estTokensSaved: num(raw.tokens_saved) || Math.round((bytesIndexed + bytesSandboxed + cacheBytesSaved) / 4),
+    estTokensSaved: num2(raw.tokens_saved) || Math.round((bytesIndexed + bytesSandboxed + cacheBytesSaved) / 4),
     tools,
     sourceDir
   };
@@ -1073,7 +1511,7 @@ class RunStore {
     for (const dir of dirs) {
       let entries = [];
       try {
-        entries = fs5.readdirSync(dir);
+        entries = fs6.readdirSync(dir);
       } catch {
         continue;
       }
@@ -1081,9 +1519,9 @@ class RunStore {
         const m = STATS_RE.exec(name);
         if (!m)
           continue;
-        const file = path5.join(dir, name);
+        const file = path6.join(dir, name);
         seen.add(file);
-        const st = fs5.statSync(file, { throwIfNoEntry: false });
+        const st = fs6.statSync(file, { throwIfNoEntry: false });
         if (!st)
           continue;
         const stamp = `${st.size}:${st.mtimeMs}`;
@@ -1091,7 +1529,7 @@ class RunStore {
         if (!hit || hit.stamp !== stamp) {
           let run = null;
           try {
-            run = parseRunFile(m[1], JSON.parse(fs5.readFileSync(file, "utf8")), dir);
+            run = parseRunFile(m[1], JSON.parse(fs6.readFileSync(file, "utf8")), dir);
           } catch {
             run = null;
           }
@@ -1241,15 +1679,31 @@ function normDir(p) {
   return process.platform === "win32" || /^[a-z]:\//i.test(s) ? s.toLowerCase() : s;
 }
 var sumPrompt = (u) => u.tokensIn + u.cacheRead + u.cacheWrite;
+async function within(p, ms) {
+  let timer;
+  try {
+    await Promise.race([p.catch(() => {
+      return;
+    }), new Promise((r) => timer = setTimeout(r, ms))]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 class Engine {
-  events = new EventIndex;
+  events;
   runs = new RunStore;
   knowledge = new KnowledgeStore;
   opencode = new OpencodeStore;
   discoveryCache = null;
   rowCache = null;
   insightCache = new Map;
+  constructor(opts = {}) {
+    this.events = new EventIndex({ cacheDir: opts.cacheDir ?? null });
+  }
+  dispose() {
+    return this.events.dispose();
+  }
   context(settings) {
     const key = JSON.stringify(settings.locations);
     const now = Date.now();
@@ -1273,11 +1727,12 @@ class Engine {
   async prepare(settings) {
     const ctx = this.context(settings);
     if (!this.events.initialDone) {
-      this.events.refresh(ctx.sessionDirs);
+      const run = this.events.refresh(ctx.sessionDirs);
+      await within(Promise.race([run, this.events.whenUseful()]), 1500);
       return ctx;
     }
     if (Date.now() - this.events.lastRefresh > 2000 || this.events.busy) {
-      await Promise.race([this.events.refresh(ctx.sessionDirs), new Promise((r) => setTimeout(r, 1500))]);
+      await within(this.events.refresh(ctx.sessionDirs), 1500);
     }
     return ctx;
   }
@@ -1539,7 +1994,7 @@ class Engine {
     let timelineTotal = 0;
     const timeline = [];
     const lists = { decisions: [], prompts: [] };
-    const counts = {
+    const counts2 = {
       files: new Map,
       errors: new Map,
       skills: new Map,
@@ -1576,15 +2031,15 @@ class Engine {
                          GROUP BY type, d`).all(id)) {
             const type = str(r.type), d = str(r.d), c = int(r.c);
             if (type.startsWith("file_"))
-              bump(counts.files, redactPaths ? redactPath(d) : d, c, type.slice(5));
+              bump(counts2.files, redactPaths ? redactPath(d) : d, c, type.slice(5));
             else if (type === "error_tool") {
               if (showContent)
-                bump(counts.errors, d, c);
+                bump(counts2.errors, d, c);
             } else if (type === "skill")
-              bump(counts.skills, d || "(unnamed)", c);
+              bump(counts2.skills, d || "(unnamed)", c);
             else
               for (const p of d.split(/,\s*/))
-                bump(counts.refs, p.trim(), c);
+                bump(counts2.refs, p.trim(), c);
           }
           const list2 = (types, limit) => db.prepare(`SELECT id, type, category, priority, data, created_at, 0 b FROM session_events
                             WHERE session_id = ? AND type IN (${types.map(() => "?").join(",")}) ORDER BY created_at DESC LIMIT ?`).all(id, ...types, limit).map(toEvent);
@@ -1632,7 +2087,7 @@ class Engine {
         series.push(pt);
     }
     const runs = this.runs.read(ctx.statsDirs).filter((r) => r.startedAt <= row.lastEventAt && (r.alive ? Date.now() : r.updatedAt) >= row.startedAt);
-    const hash = path6.basename(agg.dbFile, ".db").split("__")[0];
+    const hash = path7.basename(agg.dbFile, ".db").split("__")[0];
     const kb = this.knowledgeDbs(ctx).find((k) => k.summary.hash === hash)?.summary ?? null;
     return {
       ok: true,
@@ -1658,10 +2113,10 @@ class Engine {
       contextDrops: drops,
       timeline: timeline.slice(opts.offset, opts.offset + opts.limit),
       timelineTotal,
-      files: ranked(counts.files),
-      errors: ranked(counts.errors),
-      skills: ranked(counts.skills),
-      refs: ranked(counts.refs),
+      files: ranked(counts2.files),
+      errors: ranked(counts2.errors),
+      skills: ranked(counts2.skills),
+      refs: ranked(counts2.refs),
       decisions: newest(lists.decisions, opts.topN * 2),
       prompts: newest(lists.prompts, opts.topN * 2),
       resumes: resumes.sort((a, b) => a.at - b.at),
@@ -1930,7 +2385,8 @@ if (!Number.isInteger(port) || port <= 0 || !token) {
   console.error("[context-mode] OPENCHAMBER_SERVICE_PORT and OPENCHAMBER_SERVICE_TOKEN are required");
   process.exit(1);
 }
-var engine = new Engine;
+var dataDir = process.env.OPENCHAMBER_SERVICE_DATA_DIR || "";
+var engine = new Engine({ cacheDir: dataDir ? path8.join(dataDir, "event-index") : null });
 var MAX_BODY = 256 * 1024;
 function send(res, status, body) {
   const payload = JSON.stringify(body);
@@ -1938,7 +2394,7 @@ function send(res, status, body) {
   res.end(payload);
 }
 function readBody(req) {
-  return new Promise((resolve2, reject) => {
+  return new Promise((resolve3, reject) => {
     let size = 0;
     const chunks = [];
     req.on("data", (c) => {
@@ -1952,10 +2408,10 @@ function readBody(req) {
     });
     req.on("end", () => {
       if (!chunks.length)
-        return resolve2({});
+        return resolve3({});
       try {
         const v = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-        resolve2(typeof v === "object" && v !== null && !Array.isArray(v) ? v : {});
+        resolve3(typeof v === "object" && v !== null && !Array.isArray(v) ? v : {});
       } catch {
         reject(new Error("invalid JSON body"));
       }
@@ -2002,5 +2458,17 @@ var server = http.createServer(async (req, res) => {
   }
 });
 server.listen(port, "127.0.0.1", () => {
-  console.log(`[context-mode] listening on 127.0.0.1:${port} (node ${process.versions.node})`);
+  console.log(`[context-mode] listening on 127.0.0.1:${port} (node ${process.versions.node}; saved index ${dataDir ? "on" : "off"})`);
 });
+var stopping = false;
+function stop() {
+  if (stopping)
+    return;
+  stopping = true;
+  server.close();
+  const force = setTimeout(() => process.exit(0), 3000);
+  force.unref();
+  engine.dispose().finally(() => process.exit(0));
+}
+process.on("SIGTERM", stop);
+process.on("SIGINT", stop);

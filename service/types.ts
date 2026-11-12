@@ -85,11 +85,18 @@ export interface DiscoveryReport {
 // ------------------------------------------------------------------ status
 
 export interface IndexProgress {
-    phase: "idle" | "scanning" | "ready" | "error"
+    /** loading: reading the saved index; scanning: reading changed DBs (done of total). */
+    phase: "idle" | "loading" | "scanning" | "ready" | "error"
     done: number
     total: number
     startedAt: number
     finishedAt: number
+    /** DBs answered from the saved index without re-reading them. */
+    cached?: number
+    /** Changed DBs still showing their saved (older) figures until re-read. */
+    stale?: number
+    /** When the oldest of those saved figures were read (epoch ms); 0 when none. */
+    savedAt?: number
     error?: string
 }
 

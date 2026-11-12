@@ -30,7 +30,9 @@ import { createApi, friendly } from "./api.ts"
 import type { App, ViewRenderer } from "./app.ts"
 import { hideTip } from "./charts.ts"
 import { h, icon, iconButton, replace } from "./dom.ts"
-import { bytes, duration, full } from "./format.ts"
+import { ago, bytes, duration, full } from "./format.ts"
+import { NO_REPORT_LINE, NO_REPORT_TITLE, Poller, progressLine } from "./startup.ts"
+import type { PollOutcome } from "./startup.ts"
 import { DEFAULT_SETTINGS, RANGE_LABELS, RANGE_SHORT, initialView, normalize } from "./state.ts"
 import type { RangeKey, UiSettings, View, ViewState } from "./state.ts"
 import { renderDetail } from "./views/detail.ts"
@@ -53,7 +55,15 @@ let mounted = false
 let surface: HostReadyContext["surface"] = "panel"
 let renderSeq = 0
 let rendering = false
-let pollTimer: number | null = null
+/** Automatic refreshes: quick while the service indexes, then the saved cadence. */
+const poller = new Poller({
+    run: () => render({ keepScroll: true }),
+    isHidden: () => document.hidden || (surface !== "status" && view.view === "settings"),
+    isBusy: () => rendering,
+    setTimer: (fn, ms) => window.setTimeout(fn, ms),
+    clearTimer: (t) => window.clearTimeout(t as number),
+    now: () => Date.now(),
+})
 let lastRenderAt = 0
 const current = { sessionId: null as string | null, directory: null as string | null }
 
@@ -76,7 +86,7 @@ const app: App = {
             view.kbOffset = 0
         }
         syncChrome()
-        void render({ keepScroll: opts?.keepScroll ?? false })
+        paint({ keepScroll: opts?.keepScroll ?? false })
     },
     async saveSettings(next) {
         settings = normalize(next)
@@ -86,11 +96,11 @@ const app: App = {
         } catch (error) {
             app.toast(`Could not save settings: ${friendly(error).message}`, "error")
         }
-        schedulePoll()
+        poller.configure(settings.display.refreshSec)
         syncChrome()
     },
     refresh() {
-        void render({ keepScroll: true })
+        paint({ keepScroll: true })
     },
     copy(text, what) {
         host.writeClipboard(text).then(() => app.toast(`${what} copied`, "success"), (e) => app.toast(friendly(e).message, "error"))
@@ -219,14 +229,17 @@ function paintStatus(): void {
         replace(refs.liveChip, h("span.dot.on"), h("b", null, lives.length > 1 ? `${lives.length} servers live` : "Live"), ` · ${full(calls)} calls · ${bytes(returned)} returned · up ${duration(up)}`)
         refs.liveChip.title = lives.map((r) => `context-mode server started ${new Date(r.startedAt).toLocaleTimeString()} (parent pid ${r.pid}): ${r.calls} calls`).join("\n") + "\nCounters reset when OpenCode restarts."
     } else {
-        replace(refs.liveChip, h("span.dot"), s ? "No live context-mode server" : "Connecting…")
+        replace(refs.liveChip, h("span.dot"), s ? NO_REPORT_LINE : "Connecting…")
+        refs.liveChip.title = s ? NO_REPORT_TITLE : "Waiting for the extension's local service"
     }
     const p = s?.progress
-    if (p && p.phase === "scanning") {
-        const pctDone = p.total ? Math.round((p.done / p.total) * 100) : 0
+    const line = progressLine(p)
+    if (p && line) {
+        // The bar is the real fraction of DBs read; nothing while there is no count yet.
+        const fraction = p.phase === "scanning" && p.total ? p.done / p.total : null
         replace(refs.progress, h("div.progress", null,
-            h("span", null, `Indexing context-mode history: ${full(p.done)} of ${full(p.total)} session databases. Numbers fill in as it goes.`),
-            h("div.progress-track", null, h("div.progress-fill", { style: `--p:${(pctDone / 100).toFixed(3)}` }))))
+            h("span", null, line),
+            fraction === null ? null : h("div.progress-track", null, h("div.progress-fill", { style: `--p:${fraction.toFixed(3)}` }))))
     } else replace(refs.progress)
 }
 
@@ -239,7 +252,15 @@ const VIEWS: Record<Exclude<View, "sessions">, ViewRenderer> = {
     settings: renderSettings,
 }
 
-async function render(opts: { keepScroll: boolean } = { keepScroll: true }): Promise<void> {
+/** Render, then let the poller schedule the next automatic refresh. */
+function paint(opts: { keepScroll: boolean } = { keepScroll: true }): void {
+    void render(opts).then((o) => {
+        if (o) poller.observe(o)
+    })
+}
+
+/** Draw the current view. Resolves null when a newer render superseded this one. */
+async function render(opts: { keepScroll: boolean } = { keepScroll: true }): Promise<PollOutcome | null> {
     const seq = ++renderSeq
     const isStale = () => seq !== renderSeq
     rendering = true
@@ -247,35 +268,47 @@ async function render(opts: { keepScroll: boolean } = { keepScroll: true }): Pro
     if (refs) refs.refreshBtn.classList.add("spin")
     try {
         if (surface === "status") {
-            await renderStatus(app, root!, isStale)
-            if (!isStale()) void host.setHeight(Math.ceil(root!.scrollHeight)).catch(() => undefined)
-            return
+            const progress = await renderStatus(app, root!, isStale)
+            if (isStale()) return null
+            void host.setHeight(Math.ceil(root!.scrollHeight)).catch(() => undefined)
+            lastRenderAt = Date.now()
+            return { ready: progress?.phase === "ready" }
         }
         const main = refs!.main
         const scroll = document.scrollingElement?.scrollTop ?? 0
         status = await api<StatusPayload>("/v1/status")
-        if (isStale()) return
+        if (isStale()) return null
         paintStatus()
         const renderer: ViewRenderer = view.view === "sessions" ? (view.sessionId ? renderDetail : renderSessions) : VIEWS[view.view]
         await renderer(app, main, isStale)
-        if (isStale()) return
+        if (isStale()) return null
         replace(refs!.notice)
         if (opts.keepScroll && document.scrollingElement) document.scrollingElement.scrollTop = scroll
         else if (!opts.keepScroll) window.scrollTo({ top: 0 })
         syncChrome()
         lastRenderAt = Date.now()
+        return { ready: status.progress.phase === "ready" }
     } catch (error) {
-        if (isStale()) return
+        if (isStale()) return null
         const f = friendly(error)
-        const target = surface === "status" ? root! : refs!.notice
-        replace(target, h("div.explain", null,
-            h("h3", null, f.code === "NOT_FOUND" ? "Session not found" : "Could not load context-mode data"),
-            h("p", null, f.message),
-            f.code === "NOT_FOUND" ? null : h("p.muted", null, `Code: ${f.code}`)))
+        // Keep the last good figures on screen and say how old they are.
+        const card = surface === "status" && lastRenderAt ? root!.querySelector<HTMLElement>(".status") : null
+        if (card) {
+            card.querySelector(".status-note")?.remove()
+            card.appendChild(h("div.status-line.status-note", { title: f.message }, `Last updated ${ago(lastRenderAt)} · ${f.code === "REQUEST_FAILED" ? "the service is busy" : f.code}`))
+        } else {
+            const target = surface === "status" ? root! : refs!.notice
+            replace(target, h("div.explain", null,
+                h("h3", null, f.code === "NOT_FOUND" ? "Session not found" : "Could not load context-mode data"),
+                h("p", null, f.message),
+                f.code === "NOT_FOUND" ? null : h("p.muted", null, `Code: ${f.code}`),
+                surface !== "status" && lastRenderAt && f.code !== "NOT_FOUND" ? h("p.muted", null, `The figures below were last updated ${ago(lastRenderAt)}.`) : null))
+        }
         if (f.code === "NOT_FOUND" && view.sessionId) {
             view.sessionId = null
         }
         if (surface === "status") void host.setHeight(Math.ceil(root!.scrollHeight)).catch(() => undefined)
+        return { ready: f.code === "NOT_FOUND" && status?.progress.phase === "ready" }
     } finally {
         if (!isStale()) {
             rendering = false
@@ -296,19 +329,6 @@ async function loadProjects(): Promise<void> {
     } catch {
         // the filter keeps its previous options
     }
-}
-
-function schedulePoll(): void {
-    if (pollTimer !== null) window.clearInterval(pollTimer)
-    pollTimer = null
-    const sec = settings.display.refreshSec
-    if (!sec) return
-    pollTimer = window.setInterval(() => {
-        if (document.hidden || rendering) return
-        if (surface !== "status" && view.view === "settings") return
-        if (Date.now() - lastRenderAt < sec * 1000 - 200) return
-        void render({ keepScroll: true })
-    }, Math.max(1000, sec * 1000))
 }
 
 // ------------------------------------------------------------------- boot
@@ -333,13 +353,13 @@ host.onSession((session) => {
     const id = session?.id ?? null
     if (id === current.sessionId) return
     current.sessionId = id
-    if (mounted) void render({ keepScroll: true })
+    if (mounted) paint({ keepScroll: true })
 })
 
 host.onDirectory((directory) => {
     if (directory === current.directory) return
     current.directory = directory
-    if (mounted && surface === "status") void render({ keepScroll: true })
+    if (mounted && surface === "status") paint({ keepScroll: true })
 })
 
 host.onReady((ctx) => {
@@ -365,11 +385,16 @@ host.onReady((ctx) => {
             void loadProjects()
             window.setInterval(() => { if (!document.hidden) void loadProjects() }, 60_000)
         }
-        await render({ keepScroll: false })
-        schedulePoll()
+        const first = await render({ keepScroll: false })
+        poller.configure(settings.display.refreshSec)
+        if (first) poller.observe(first)
     })()
 })
 
+window.addEventListener("pagehide", (e) => {
+    if (!e.persisted) poller.dispose()
+})
+
 document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && mounted && Date.now() - lastRenderAt > 2000) void render({ keepScroll: true })
+    if (!document.hidden && mounted && Date.now() - lastRenderAt > 2000) paint({ keepScroll: true })
 })

@@ -44,7 +44,7 @@ export const SES_CHILD = "ses_child000000000000000002"
 export const SES_OTHER = "ses_other000000000000000003"
 export const SES_TEST = "test-session-1"
 
-function sessionDb(file: string, dir: string, rows: [sid: string, type: string, data: string, minutesAgo: number][], meta: [sid: string, compact: number][], resume?: [string, string, number]): void {
+export function sessionDb(file: string, dir: string, rows: [sid: string, type: string, data: string, minutesAgo: number][], meta: [sid: string, compact: number][], resume?: [string, string, number]): void {
     const db = new DatabaseSync(file)
     db.exec(SESSION_SCHEMA)
     const ins = db.prepare("INSERT INTO session_events (session_id, type, category, data, project_dir, source_hook, created_at) VALUES (?, ?, ?, ?, ?, 'test', ?)")
@@ -55,7 +55,7 @@ function sessionDb(file: string, dir: string, rows: [sid: string, type: string, 
     db.close()
 }
 
-const step = (tin: number, tout: number, cr: number, cw = 0, cost = 0) => `tokens_in:${tin} tokens_out:${tout} cache_create:${cw} cache_read:${cr} cost_usd:${cost}`
+export const step = (tin: number, tout: number, cr: number, cw = 0, cost = 0) => `tokens_in:${tin} tokens_out:${tout} cache_create:${cw} cache_read:${cr} cost_usd:${cost}`
 
 export function makeFixture(): Fixture {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "cm-fixture-"))

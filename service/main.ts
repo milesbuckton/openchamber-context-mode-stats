@@ -18,9 +18,14 @@
  *   POST /v1/runs        { settings, filter, offset, limit }
  *   POST /v1/knowledge   { settings, filter, offset, limit, sort }
  *   POST /v1/brief       { settings, sessionId, directory }
+ *
+ * The derived event index is saved under OPENCHAMBER_SERVICE_DATA_DIR (this
+ * extension's own folder, set by the host) so a restarted service answers at
+ * once; without that variable the index stays in memory.
  */
 
 import http from "node:http"
+import * as path from "node:path"
 import type { IncomingMessage, ServerResponse } from "node:http"
 import { Engine } from "./engine.ts"
 import { normalizeFilter, normalizeSettings } from "./settings.ts"
@@ -34,7 +39,8 @@ if (!Number.isInteger(port) || port <= 0 || !token) {
     process.exit(1)
 }
 
-const engine = new Engine()
+const dataDir = process.env.OPENCHAMBER_SERVICE_DATA_DIR || ""
+const engine = new Engine({ cacheDir: dataDir ? path.join(dataDir, "event-index") : null })
 const MAX_BODY = 256 * 1024
 
 function send(res: ServerResponse, status: number, body: unknown): void {
@@ -133,5 +139,18 @@ const server = http.createServer(async (req, res) => {
 })
 
 server.listen(port, "127.0.0.1", () => {
-    console.log(`[context-mode] listening on 127.0.0.1:${port} (node ${process.versions.node})`)
+    console.log(`[context-mode] listening on 127.0.0.1:${port} (node ${process.versions.node}; saved index ${dataDir ? "on" : "off"})`)
 })
+
+let stopping = false
+function stop(): void {
+    if (stopping) return
+    stopping = true
+    server.close()
+    // Save what was indexed; the host kills us anyway after its own timeout.
+    const force = setTimeout(() => process.exit(0), 3000)
+    force.unref()
+    engine.dispose().finally(() => process.exit(0))
+}
+process.on("SIGTERM", stop)
+process.on("SIGINT", stop)

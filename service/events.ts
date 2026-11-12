@@ -24,6 +24,7 @@ import * as path from "node:path"
 import { int, sqliteTime, str, tableNames, withDb } from "./sqlite.ts"
 import type { Db } from "./sqlite.ts"
 import { SESSION_DB_RE } from "./discover.ts"
+import { IndexCache } from "./indexcache.ts"
 import { dayKey, yieldTick } from "./util.ts"
 import type { EventTally, IndexProgress, Usage } from "./types.ts"
 
@@ -88,6 +89,10 @@ interface DbIndex {
     hash: string
     stamp: string
     sessions: DbSession[]
+    /** When the sessions came from the saved index: when they were read. */
+    savedAt?: number
+    /** Sessions came from the saved index (fresh or awaiting a re-read). */
+    saved?: boolean
     error?: string
 }
 
@@ -201,11 +206,12 @@ export function typeGroup(type: string): string {
 
 // ------------------------------------------------------------- per-DB read
 
-function fileStamp(file: string): string | null {
+/** Change stamp of a DB and its WAL (a write may touch only the WAL), plus the newest of their mtimes. */
+function fileStat(file: string): { stamp: string; mtime: number } | null {
     const st = fs.statSync(file, { throwIfNoEntry: false })
     if (!st) return null
     const wal = fs.statSync(file + "-wal", { throwIfNoEntry: false })
-    return `${st.size}:${st.mtimeMs}:${wal?.size ?? 0}:${wal?.mtimeMs ?? 0}`
+    return { stamp: `${st.size}:${st.mtimeMs}:${wal?.size ?? 0}:${wal?.mtimeMs ?? 0}`, mtime: Math.max(st.mtimeMs, wal?.mtimeMs ?? 0) }
 }
 
 /** Read one session DB. Exported for tests. */
@@ -282,8 +288,8 @@ function readSessions(db: Db, file: string): DbSession[] {
 
 /** Merge one session's per-DB copies. Exported for tests. */
 export function mergeSession(parts: DbSession[]): SessionAgg {
-    // Home DB: most ordinary events, then earliest start.
-    const ordered = [...parts].sort((a, b) => b.events - a.events || (a.startedAt || Infinity) - (b.startedAt || Infinity))
+    // Home DB: most ordinary events, then earliest start, then file name (so the result never depends on read order).
+    const ordered = [...parts].sort((a, b) => b.events - a.events || (a.startedAt || Infinity) - (b.startedAt || Infinity) || (a.dbFile < b.dbFile ? -1 : a.dbFile > b.dbFile ? 1 : 0))
     const home = ordered[0]
     const types: Record<string, number> = {}
     const days = new Map<string, DayAgg>()
@@ -309,7 +315,7 @@ export function mergeSession(parts: DbSession[]): SessionAgg {
     // Union of steps, de-duplicated on (time, in, out, cache read, cache write).
     const seen = new Set<string>()
     const merged: number[] = []
-    const all = parts.length === 1 ? [parts[0].steps] : parts.map((p) => p.steps)
+    const all = ordered.map((p) => p.steps)
     for (const steps of all) {
         for (let o = 0; o < steps.length; o += STEP_STRIDE) {
             const key = `${steps[o]}|${steps[o + 1]}|${steps[o + 2]}|${steps[o + 3]}|${steps[o + 4]}`
@@ -357,44 +363,104 @@ export function mergeSession(parts: DbSession[]): SessionAgg {
 
 // ------------------------------------------------------------------ index
 
+export interface EventIndexOptions {
+    /** Folder for the persistent derived index; null/undefined keeps it in memory only. */
+    cacheDir?: string | null
+    /** Reads one DB. Defaults to indexSessionDb; tests inject a spy. */
+    reader?: (file: string) => DbSession[]
+    /** Longest stretch of synchronous DB reading before yielding to the HTTP server. */
+    sliceMs?: number
+}
+
+const hashOf = (file: string): string => path.basename(file, ".db").split("__")[0]
+
 export class EventIndex {
     private dbs = new Map<string, DbIndex>()
     private running: Promise<void> | null = null
+    private runningGen = -1
+    private gen = 0
     private dirsKey = ""
     private merged = new Map<string, SessionAgg>()
     private dirty = new Set<string>()
     private list: SessionAgg[] | null = null
+    private readonly cache: IndexCache | null
+    private readonly reader: (file: string) => DbSession[]
+    private readonly sliceMs: number
+    private cacheLoaded = false
+    private disposed = false
+    private useful: { promise: Promise<void>; resolve: () => void }
     lastRefresh = 0
     progress: IndexProgress = { phase: "idle", done: 0, total: 0, startedAt: 0, finishedAt: 0 }
     /** Bumps whenever indexed data changes; consumers key caches on it. */
     version = 0
     initialDone = false
 
-    /** Start (or join) a refresh of every DB under `dirs`. */
+    constructor(opts: EventIndexOptions = {}) {
+        this.cache = opts.cacheDir ? new IndexCache(opts.cacheDir) : null
+        this.reader = opts.reader ?? indexSessionDb
+        this.sliceMs = Math.max(0, opts.sliceMs ?? 30)
+        this.useful = deferred()
+    }
+
+    /**
+     * Start (or join) a refresh of every DB under `dirs`. A different set of
+     * folders discards the old index first; a refresh still running for the old
+     * folders stops at its next step and adds nothing.
+     */
     refresh(dirs: string[]): Promise<void> {
         const key = dirs.join("|")
         if (key !== this.dirsKey) {
             this.dirsKey = key
+            this.gen++
             this.dbs.clear()
             this.merged.clear()
             this.dirty.clear()
             this.list = null
             this.initialDone = false
+            this.cacheLoaded = false
+            this.useful.resolve()
+            this.useful = deferred()
+            this.progress = { phase: "idle", done: 0, total: 0, startedAt: 0, finishedAt: 0 }
             this.version++
         }
-        if (this.running) return this.running
-        this.running = this.run(dirs).finally(() => {
-            this.running = null
-            this.lastRefresh = Date.now()
-        })
-        return this.running
+        if (this.disposed) return Promise.resolve()
+        if (this.running && this.runningGen === this.gen) return this.running
+        const gen = this.gen
+        const p: Promise<void> = (this.running ?? Promise.resolve())
+            .catch(() => undefined)
+            .then(() => this.run(dirs, gen))
+            .finally(() => {
+                if (this.running === p) this.running = null
+                this.lastRefresh = Date.now()
+                if (gen === this.gen) this.useful.resolve()
+            })
+        this.running = p
+        this.runningGen = gen
+        return p
     }
 
     get busy(): boolean {
         return this.running !== null
     }
 
-    private async run(dirs: string[]): Promise<void> {
+    /** Resolves once the first useful answer is possible: the saved index is loaded and the newest DBs are read. */
+    whenUseful(): Promise<void> {
+        return this.initialDone ? Promise.resolve() : this.useful.promise
+    }
+
+    /** Stop any scan, then save what was read. */
+    async dispose(): Promise<void> {
+        this.disposed = true
+        await this.running?.catch(() => undefined)
+        await this.cache?.dispose()
+    }
+
+    private live(gen: number): boolean {
+        return !this.disposed && gen === this.gen
+    }
+
+    private async run(dirs: string[], gen: number): Promise<void> {
+        if (!this.live(gen)) return
         const files: string[] = []
         for (const dir of dirs) {
             let entries: string[] = []
@@ -405,11 +471,38 @@ export class EventIndex {
             }
             for (const name of entries) if (SESSION_DB_RE.test(name)) files.push(path.join(dir, name))
         }
-        const changed: [string, string][] = []
+
+        let cached = 0
+        if (!this.cacheLoaded) {
+            this.cacheLoaded = true
+            if (this.cache) {
+                this.progress = { phase: "loading", done: 0, total: 0, startedAt: Date.now(), finishedAt: 0 }
+                this.cache.setScope(dirs)
+                const loaded = await this.cache.load(files)
+                if (!this.live(gen)) return
+                for (const e of loaded.values()) {
+                    this.cache.adopt(e)
+                    this.dbs.set(e.file, { file: e.file, hash: hashOf(e.file), stamp: e.stamp, sessions: e.sessions, savedAt: e.savedAt, saved: true })
+                    for (const s of e.sessions) this.dirty.add(s.id)
+                }
+                if (loaded.size) this.bump()
+            }
+        }
+
+        const initial = !this.initialDone
+        const changed: { file: string; stamp: string; mtime: number }[] = []
+        let slice = performance.now()
         for (const file of files) {
-            const stamp = fileStamp(file)
-            if (!stamp) continue
-            if (this.dbs.get(file)?.stamp !== stamp) changed.push([file, stamp])
+            const st = fileStat(file)
+            if (!st) continue
+            const prev = this.dbs.get(file)
+            if (prev?.stamp !== st.stamp) changed.push({ file, ...st })
+            else if (initial && prev?.saved) cached++
+            if (performance.now() - slice >= Math.max(this.sliceMs, 5)) {
+                await yieldTick()
+                if (!this.live(gen)) return
+                slice = performance.now()
+            }
         }
         const present = new Set(files)
         let removed = false
@@ -417,42 +510,80 @@ export class EventIndex {
             if (present.has(file)) continue
             for (const s of db.sessions) this.dirty.add(s.id)
             this.dbs.delete(file)
+            this.cache?.remove(file)
             removed = true
         }
         if (!changed.length) {
             if (removed) this.bump()
-            if (!this.initialDone) this.finish(files.length)
+            if (initial) this.finish(files.length, cached)
+            this.save(initial)
             return
         }
-        const initial = !this.initialDone
-        if (initial) this.progress = { phase: "scanning", done: 0, total: changed.length, startedAt: Date.now(), finishedAt: 0 }
+
+        // Newest first: the chat in use is the DB written last.
+        changed.sort((a, b) => b.mtime - a.mtime)
+        let stale = 0
+        let savedAt = 0
+        for (const c of changed) {
+            const prev = this.dbs.get(c.file)
+            if (prev?.saved) {
+                stale++
+                savedAt = savedAt ? Math.min(savedAt, prev.savedAt ?? 0) : prev.savedAt ?? 0
+            }
+        }
+        if (initial) {
+            this.progress = {
+                phase: "scanning", done: 0, total: changed.length, startedAt: this.progress.startedAt || Date.now(), finishedAt: 0,
+                cached, stale, savedAt: stale ? savedAt : 0,
+            }
+        }
         let i = 0
-        for (const [file, stamp] of changed) {
-            const hash = path.basename(file, ".db").split("__")[0]
+        slice = performance.now()
+        for (const { file, stamp } of changed) {
+            if (!this.live(gen)) return
             const prev = this.dbs.get(file)
             if (prev) for (const s of prev.sessions) this.dirty.add(s.id)
+            let reread = false
             try {
-                const sessions = indexSessionDb(file)
+                const sessions = this.reader(file)
+                reread = true
                 for (const s of sessions) this.dirty.add(s.id)
-                this.dbs.set(file, { file, hash, stamp, sessions })
+                this.dbs.set(file, { file, hash: hashOf(file), stamp, sessions })
+                this.cache?.put({ file, stamp, savedAt: Date.now(), sessions })
             } catch (error) {
                 // Locked or corrupt: keep the previous copy; an empty stamp retries next refresh.
-                this.dbs.set(file, { file, hash, stamp: "", sessions: prev?.sessions ?? [], error: error instanceof Error ? error.message : String(error) })
+                this.dbs.set(file, { file, hash: hashOf(file), stamp: "", sessions: prev?.sessions ?? [], savedAt: prev?.savedAt, saved: prev?.saved, error: error instanceof Error ? error.message : String(error) })
             }
             i++
-            if (initial) this.progress.done = i
-            if (i % 8 === 0) {
+            if (initial) {
+                this.progress.done = i
+                // A DB that failed to re-read still shows its saved figures.
+                if (reread && prev?.saved && this.progress.stale) this.progress.stale--
+                if (!this.progress.stale) this.progress.savedAt = 0
+            }
+            if (performance.now() - slice >= this.sliceMs) {
                 if (initial) this.bump()
+                this.useful.resolve()
+                this.cache?.requestFlush()
                 await yieldTick()
+                slice = performance.now()
             }
         }
         this.bump()
-        this.finish(files.length)
+        if (initial) this.finish(files.length, cached)
+        this.save(initial)
     }
 
-    private finish(total: number): void {
+    /** The first complete index is saved at once; later changes are batched. */
+    private save(now: boolean): void {
+        if (now) void this.cache?.flush()
+        else this.cache?.requestFlush()
+    }
+
+    private finish(total: number, cached: number): void {
         this.initialDone = true
-        this.progress = { phase: "ready", done: total, total, startedAt: this.progress.startedAt, finishedAt: Date.now() }
+        this.progress = { phase: "ready", done: total, total, startedAt: this.progress.startedAt, finishedAt: Date.now(), cached, stale: 0, savedAt: 0 }
+        this.useful.resolve()
     }
 
     private bump(): void {
@@ -460,7 +591,7 @@ export class EventIndex {
         this.list = null
     }
 
-    /** Every session, merged across DBs. Only sessions touched since the last call are re-merged. */
+    /** Every session, merged across DBs, in id order. Only sessions touched since the last call are re-merged. */
     sessions(): SessionAgg[] {
         if (this.list && !this.dirty.size) return this.list
         if (this.dirty.size) {
@@ -480,7 +611,7 @@ export class EventIndex {
             }
             this.dirty.clear()
         }
-        this.list = [...this.merged.values()]
+        this.list = [...this.merged.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
         return this.list
     }
 
@@ -491,8 +622,10 @@ export class EventIndex {
 
     /** Hash (file name before `__`) → project directory, for knowledge-base DBs. */
     projectForHash(hash: string): string | null {
-        for (const db of this.dbs.values()) {
-            if (db.hash !== hash) continue
+        // The project's own DB (`<hash>.db`) first, then its worktree DBs by name: never read order.
+        const rank = (db: DbIndex) => (path.basename(db.file) === `${hash}.db` ? "" : path.basename(db.file))
+        const candidates = [...this.dbs.values()].filter((db) => db.hash === hash).sort((a, b) => (rank(a) < rank(b) ? -1 : rank(a) > rank(b) ? 1 : 0))
+        for (const db of candidates) {
             const best = [...db.sessions].sort((a, b) => b.events - a.events).find((s) => s.projectDir)
             if (best) return best.projectDir
         }
@@ -502,4 +635,10 @@ export class EventIndex {
     errors(): { file: string; error: string }[] {
         return [...this.dbs.values()].filter((d) => d.error).map((d) => ({ file: d.file, error: d.error as string }))
     }
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve: () => void = () => undefined
+    const promise = new Promise<void>((r) => (resolve = r))
+    return { promise, resolve }
 }

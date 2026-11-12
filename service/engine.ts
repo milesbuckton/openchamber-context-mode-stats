@@ -47,14 +47,38 @@ export function normDir(p: string): string {
 
 const sumPrompt = (u: Usage): number => u.tokensIn + u.cacheRead + u.cacheWrite
 
+export interface EngineOptions {
+    /** Folder for the persistent derived event index; null keeps it in memory only. */
+    cacheDir?: string | null
+}
+
+/** Resolve after `p` or `ms`, whichever is first, without leaving a timer behind. */
+async function within(p: Promise<unknown>, ms: number): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+        await Promise.race([p.catch(() => undefined), new Promise<void>((r) => (timer = setTimeout(r, ms)))])
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
 export class Engine {
-    readonly events = new EventIndex()
+    readonly events: EventIndex
     readonly runs = new RunStore()
     readonly knowledge = new KnowledgeStore()
     readonly opencode = new OpencodeStore()
     private discoveryCache: { key: string; at: number; report: DiscoveryReport } | null = null
     private rowCache: { key: string; rows: SessionRow[]; byId: Map<string, SessionRow> } | null = null
     private insightCache = new Map<string, { at: number; payload: InsightsPayload }>()
+
+    constructor(opts: EngineOptions = {}) {
+        this.events = new EventIndex({ cacheDir: opts.cacheDir ?? null })
+    }
+
+    /** Stop indexing and save the derived index. */
+    dispose(): Promise<void> {
+        return this.events.dispose()
+    }
 
     // ----------------------------------------------------------- context
 
@@ -80,18 +104,20 @@ export class Engine {
     }
 
     /**
-     * Bring the event index up to date. During the first full scan requests
-     * answer from the partial index instead of waiting; afterwards a refresh
-     * (usually a handful of changed DBs) is awaited briefly.
+     * Bring the event index up to date. During the first scan a request waits
+     * (at most 1.5 s) for the saved index and the newest DBs, then answers from
+     * the partial index while older history continues in the background;
+     * afterwards a refresh (usually a handful of changed DBs) is awaited briefly.
      */
     async prepare(settings: ServiceSettings): Promise<Ctx> {
         const ctx = this.context(settings)
         if (!this.events.initialDone) {
-            void this.events.refresh(ctx.sessionDirs)
+            const run = this.events.refresh(ctx.sessionDirs)
+            await within(Promise.race([run, this.events.whenUseful()]), 1500)
             return ctx
         }
         if (Date.now() - this.events.lastRefresh > 2000 || this.events.busy) {
-            await Promise.race([this.events.refresh(ctx.sessionDirs), new Promise((r) => setTimeout(r, 1500))])
+            await within(this.events.refresh(ctx.sessionDirs), 1500)
         }
         return ctx
     }
