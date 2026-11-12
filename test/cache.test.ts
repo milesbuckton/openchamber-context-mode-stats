@@ -310,15 +310,34 @@ describe("startup order and responsiveness", () => {
             maxGap = Math.max(maxGap, t - last)
             last = t
         }, 5)
+        // Event-loop turns, counted independently of wall-clock (which includes OS scheduling under load).
+        let turn = 0
+        let counting = true
+        const tick = () => {
+            turn++
+            if (counting) setImmediate(tick)
+        }
+        setImmediate(tick)
+        let stretch = 0
+        let maxStretch = 0
+        let lastTurn = -1
         const progress: number[] = []
-        const spy = spyReader(() => busy(25))
+        const spy = spyReader(() => {
+            stretch = turn === lastTurn ? stretch + 1 : 1
+            lastTurn = turn
+            maxStretch = Math.max(maxStretch, stretch)
+            busy(25)
+        })
         const idx = new EventIndex({ reader: spy.read })
         const run = idx.refresh([dir])
         const sampler = setInterval(() => progress.push(idx.progress.done), 10)
         await run
+        counting = false
         clearInterval(probe)
         clearInterval(sampler)
-        assert.ok(maxGap < 160, `event loop blocked for ${maxGap.toFixed(0)} ms`)
+        // 25 ms reads with a 30 ms slice: at most two reads before the server gets a turn (the old code did eight).
+        assert.ok(maxStretch <= 2, `${maxStretch} slow reads ran without yielding`)
+        assert.ok(maxGap < 500, `event loop blocked for ${maxGap.toFixed(0)} ms`)
         assert.ok(progress.some((d) => d > 0 && d < 24), "progress visible mid-scan")
         assert.deepEqual(progress, [...progress].sort((a, b) => a - b), "progress never goes backwards")
     })

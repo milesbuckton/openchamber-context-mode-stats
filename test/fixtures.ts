@@ -32,9 +32,16 @@ CREATE TABLE session_resume (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TE
 CREATE TABLE tool_calls (session_id TEXT NOT NULL, tool TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY (session_id, tool));`
 
-/** UTC SQLite text for `minutesAgo` minutes before now. */
+/**
+ * One clock per fixture: rows written "41 minutes ago" in two DBs must carry the
+ * same second, or the duplicated model steps stop being duplicates when building
+ * the fixture happens to cross a second boundary (a flaky test under load).
+ */
+let fixtureNow = Date.now()
+
+/** UTC SQLite text for `minutesAgo` minutes before the fixture's clock. */
 export function ts(minutesAgo: number): string {
-    return new Date(Date.now() - minutesAgo * 60_000).toISOString().slice(0, 19).replace("T", " ")
+    return new Date(fixtureNow - minutesAgo * 60_000).toISOString().slice(0, 19).replace("T", " ")
 }
 
 export const PROJECT_A = "/work/alpha"
@@ -58,6 +65,7 @@ export function sessionDb(file: string, dir: string, rows: [sid: string, type: s
 export const step = (tin: number, tout: number, cr: number, cw = 0, cost = 0) => `tokens_in:${tin} tokens_out:${tout} cache_create:${cw} cache_read:${cr} cost_usd:${cost}`
 
 export function makeFixture(): Fixture {
+    fixtureNow = Date.now()
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "cm-fixture-"))
     const sessionsDir = path.join(home, "AppData", "Roaming", "opencode", "context-mode", "sessions")
     const statsDir = path.join(home, ".config", "opencode", "context-mode", "sessions")
