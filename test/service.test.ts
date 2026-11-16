@@ -137,9 +137,11 @@ describe("engine", () => {
 
     it("applies range, project, search, subagent and exclusion filters", () => {
         const ctx = engine.context(settings)
-        const today = new Date()
-        const day = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`
-        assert.deepEqual(engine.filtered(ctx, { from: day, to: day }).map((r) => r.id).sort(), [SES_CHILD, SES_MAIN].sort())
+        // The fixture's recent events are 33–50 minutes old: shortly after local midnight they are
+        // yesterday's, so filter on the days of the last two hours rather than on "today".
+        const local = (ms: number) => { const d = new Date(ms); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}` }
+        const range = { from: local(Date.now() - 2 * 3_600_000), to: local(Date.now()) }
+        assert.deepEqual(engine.filtered(ctx, range).map((r) => r.id).sort(), [SES_CHILD, SES_MAIN].sort())
         assert.deepEqual(engine.filtered(ctx, { q: "login" }).map((r) => r.id), [SES_MAIN])
         assert.deepEqual(engine.filtered(ctx, { project: PROJECT_A, subagents: false }).map((r) => r.id), [SES_MAIN])
         const excluding = engine.context(normalizeSettings({ ...settings, filters: { hideSynthetic: false, excludeProjects: "/work/beta" } }))
