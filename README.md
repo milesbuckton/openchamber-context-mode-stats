@@ -109,6 +109,44 @@ database is required for the basic views; absent metadata simply reduces enrichm
 The fixture suite checks parsing, discovery, filtering, privacy and compatible synthetic
 schemas. It does not certify every provider, desktop runtime, platform or context-mode release.
 
+## Startup and the saved index
+
+The extension's service starts when you open the panel or a chat's Work Status card, and
+OpenChamber stops it after ten idle minutes. To avoid re-reading every context-mode session
+database on each start, the service saves what it derives from them and reuses it.
+
+- **What is saved.** For each session database: the session ids, each session's project
+  folder, per-day and per-hour event counts, and the numbers of each model step (time, tokens,
+  cost). No event text: prompts, errors, decisions, commands and file paths stay in
+  context-mode's own databases, which are only ever read.
+- **Where.** In the extension's own data folder, which OpenChamber provides as
+  `OPENCHAMBER_SERVICE_DATA_DIR` and deletes when the extension is removed, under
+  `event-index/` (64 small JSON files, roughly 15 MB for 2,000 databases). Hosts that do not
+  provide the folder keep the index in memory only, as 1.0 did.
+- **When it is trusted.** An entry is used only for the exact database it was made from, and
+  only while that database's size and modification time, and those of its write-ahead log,
+  are unchanged. Anything unreadable, truncated, written by another version, made in another
+  time zone or malformed is ignored and rebuilt. Writes are atomic, so a crash or a second
+  running copy of the service costs at most a cache miss, never a wrong number.
+- **What you see while it loads.** The first start after installing or updating reads every
+  database once, newest first, so the chat in use appears early. The progress line shows real
+  counts, for example "682 of 2,060 session databases, newest first". Later starts load the
+  saved index and re-read only what changed. Databases that changed since the save keep
+  their saved figures, marked as stale, until they are re-read.
+- **How fast.** On a machine with 2,060 session databases, a restart was ready in about
+  1.1 s with every session in the first answer; 1.0 needed 4.7 s and showed 36 sessions
+  first. A first-ever start still reads everything, which took 25–55 s on that machine
+  depending on how warm the disk cache was.
+
+While the index loads, the panel refreshes every 1–5 seconds for up to two minutes, never
+slower than your refresh setting, and then returns to that setting. "Manual only" stays
+manual. Each page has at most one request to the service open at a time; a newer request
+(a navigation, a chat switch) replaces one that is still waiting, and the latest view wins.
+
+"No recent context-mode activity report" means no running context-mode server has written
+its stats report recently. context-mode writes that report after it answers a tool call, so
+the message does not mean the server failed to start.
+
 ## Settings
 
 - **Locations.** Standard OpenCode locations beneath your home folder are checked on Windows,
@@ -140,11 +178,23 @@ bun run typecheck
 bun run test        # node --test against fixture databases
 bun run smoke       # read-only run against the stores on this machine
 bun run dev         # http://127.0.0.1:5178 — the real panel and service in a fake host
+node --no-warnings scripts/bench-startup.ts   # cold start and restart timings of the built service
 ```
+
+`scripts/bench-startup.ts` starts the built service as a throwaway child with a temporary data
+folder, twice: once with no saved index and once with it. It records the first health reply,
+first status, first answer with sessions, ready time, health latency while indexing and how
+many databases each start re-read. `--sessions <dir>` pins a session folder, `--runtime <exe>`
+uses another runtime (for example OpenChamber's own, with `ELECTRON_RUN_AS_NODE` set), and
+`--entry <main.js>` benchmarks another build. Session stores are only read.
 
 The dev harness emulates the OpenChamber host (theme, storage, service proxy) and offers rail,
 page and Work Status layouts in dark and light. `#view=runs`, `#range=30d` or
-`#session=ses_…` in the panel URL open a view directly.
+`#session=ses_…` in the panel URL open a view directly. Its header counts the service requests
+each frame has open (and the most seen at once). **Switch session** sends a host chat change to
+every frame. `?slow=<ms>` delays every service answer to widen races, and `?panel=<path>` loads
+another build of the page for before/after checks. Set `OPENCHAMBER_SERVICE_DATA_DIR` before
+`bun run dev` to exercise the saved index.
 
 ## Notes on context-mode
 
@@ -164,7 +214,11 @@ Building this surfaced behaviour worth knowing when you read context-mode's own 
 - unsupported/missing tables and some read errors can yield empty or zero results. Check
   Locations and your capture setup before interpreting them as no activity;
 - after updating the built extension, restart its background service or OpenChamber so the
-  running service loads the new bundle. Changing this reader does not repair its data producer.
+  running service loads the new bundle. The first start after an update builds the saved
+  index once (see *Startup and the saved index*). Changing this reader does not repair its
+  data producer.
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
 ## License
 

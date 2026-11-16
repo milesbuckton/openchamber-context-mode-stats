@@ -1,6 +1,6 @@
 {
     "name": "openchamber-context-mode",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "private": true,
     "type": "module",
     "description": "OpenChamber extension: everything context-mode records for OpenCode, per session and across runs",
