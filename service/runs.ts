@@ -102,6 +102,9 @@ export function aggregateRuns(runs: RunSummary[]): RunAggregate {
     return acc
 }
 
+/** A stats file modified this recently may have changed without changing its size or mtime. */
+const RECENT_MS = 2000
+
 export class RunStore {
     private cache = new Map<string, { stamp: string; run: RunSummary | null }>()
     private aliveCache = new Map<string, { at: number; alive: boolean }>()
@@ -131,7 +134,10 @@ export class RunStore {
                 if (!st) continue
                 const stamp = `${st.size}:${st.mtimeMs}`
                 let hit = this.cache.get(file)
-                if (!hit || hit.stamp !== stamp) {
+                // Another server can overwrite the file with a same-size report inside one file-time
+                // tick; a recently written file is therefore always re-read, an old unchanged one never.
+                const recent = Date.now() - st.mtimeMs < RECENT_MS
+                if (!hit || hit.stamp !== stamp || recent) {
                     let run: RunSummary | null = null
                     try {
                         run = parseRunFile(m[1], JSON.parse(fs.readFileSync(file, "utf8")), dir)

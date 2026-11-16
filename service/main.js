@@ -1500,6 +1500,7 @@ function aggregateRuns(runs) {
   acc.tools = [...tools.values()].sort((a, b) => b.calls - a.calls || b.bytes - a.bytes);
   return acc;
 }
+var RECENT_MS = 2000;
 
 class RunStore {
   cache = new Map;
@@ -1526,7 +1527,8 @@ class RunStore {
           continue;
         const stamp = `${st.size}:${st.mtimeMs}`;
         let hit = this.cache.get(file);
-        if (!hit || hit.stamp !== stamp) {
+        const recent = Date.now() - st.mtimeMs < RECENT_MS;
+        if (!hit || hit.stamp !== stamp || recent) {
           let run = null;
           try {
             run = parseRunFile(m[1], JSON.parse(fs6.readFileSync(file, "utf8")), dir);
